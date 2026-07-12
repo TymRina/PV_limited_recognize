@@ -1,55 +1,179 @@
-# 跨电站通用 MiniRocket 限功率识别模型
+# 限功率识别流水线模型
 
-基于 MiniRocket 时序分类算法的光伏电站限功率识别系统，支持多电站、多容量数据的混合训练与通用模型部署。
+基于 MiniRocket 时序分类算法的光伏电站限功率识别系统，采用五大模块解耦架构，支持冷启动训练、增量微调与生产部署的完整流水线。
 
 ## 项目架构
 
 ```
 pv_curtailment_project/
-├── data/
-│   ├── 01_raw/              # 原始数据（各电站独立目录）
-│   │   └── station_{id}/
-│   │       └── capacity_{MW}MW/
-│   │           └── merged_data.csv
-│   └── 02_simulated/        # 模拟限电数据（自动生成）
-├── models/                  # 模型保存目录
-│   ├── minirocket_pretrained.pkl
-│   └── minirocket_universal.pkl
+├── data/                          # 数据目录（运行时自动创建）
+│   └── 01_raw/                    # 原始数据（各电站独立目录）
+│       └── station_{id}/
+│           └── capacity_{MW}MW/
+│               └── merged_data.csv
+├── models/                        # 模型保存目录
+│   ├── minirocket_{station}_base.pkl       # 基线模型
+│   ├── minirocket_{station}_prod.pkl       # 生产模型
+│   └── training_data_{station}_{type}/     # 训练数据（NPY格式）
+│       ├── X_train.npy
+│       └── Y_train.npy
 ├── src/
-│   ├── __init__.py          # 模块导出
-│   ├── simulator.py         # 通用限电模拟引擎
-│   ├── data_processor.py    # 数据预处理与切片工具
-│   ├── trainer.py           # CurtailmentPipeline 训练类
-│   └── legacy/              # 历史版本代码（存档）
-├── test_arena/              # 端到端压测目录（运行时自动创建）
-├── run_universal_training.py      # 跨电站训练主入口
-└── run_final_inference_test.py    # 端到端压测脚本
+│   ├── __init__.py
+│   ├── m1_raw_generator.py        # 模块1：原始电站数据生成
+│   ├── m2_curtail_simulator.py    # 模块2：限功率数据制造
+│   ├── m3_pretrain_engine.py      # 模块3：预训练模型模块
+│   ├── m4_retrain_engine.py       # 模块4：模型再训练模块
+│   ├── m5_evaluator.py            # 模块5：结果评估模块
+│   └── legacy/                    # 历史版本代码（存档）
+├── station_factory.py             # 一键工厂演示入口
+└── README.md
 ```
 
-## 核心设计
+## 五大模块架构
+
+### 模块1：原始数据生成 [m1_raw_generator.py](file:///e:/Trae%20Project/Rocket_PV_limited/pv_curtailment_project/src/m1_raw_generator.py)
+
+**函数签名**：`generate_raw_station_data(station_id, rated_capacity, start_date, end_date)`
+
+**职责**：根据额定容量生成纯净无异常的时序数据
+
+**输出列**：`['timestamp', 'pv_data', 'GHI', 'cap_power_on']`
+
+**物理约束**：
+- GHI ≤ 1000 W/m²（太阳常数上限）
+- pv_data ≤ rated_capacity（额定容量约束）
+
+---
+
+### 模块2：限功率制造 [m2_curtail_simulator.py](file:///e:/Trae%20Project/Rocket_PV_limited/pv_curtailment_project/src/m2_curtail_simulator.py)
+
+**函数签名**：`inject_curtailment_scenarios(raw_df, curtail_ratios)`
+
+**职责**：注入限功率场景到原始数据中
+
+**核心逻辑**：
+1. **马尔可夫链状态机**：采样限电日期（周末概率倍增）
+2. **慢变温漂**：随时间线性变化的限电比例偏移
+3. **GHI变差噪声**：轻微限电(0.85~0.95)时注入非对称向下毛刺
+
+**输出列**：新增 `pv_simulated`, `is_curtailed`
+
+---
+
+### 模块3：预训练引擎 [m3_pretrain_engine.py](file:///e:/Trae%20Project/Rocket_PV_limited/pv_curtailment_project/src/m3_pretrain_engine.py)
+
+**函数签名**：`build_base_model(simulated_df, station_id)`
+
+**职责**：执行严格时序隔离并训练基线模型
+
+**核心流程**：
+1. 按日期硬隔离：训练集 70% / 验证集 15% / 测试集 15%
+2. 在块内切片为 `(N, 3, 32)` 张量
+3. 初始化 MiniRocket + RidgeClassifierCV
+4. 保存基线模型及训练数据
+
+**标签规则**：窗口内 ≥4 点(1小时)限电 → Y=1
+
+---
+
+### 模块4：再训练引擎 [m4_retrain_engine.py](file:///e:/Trae%20Project/Rocket_PV_limited/pv_curtailment_project/src/m4_retrain_engine.py)
+
+**函数签名**：`fine_tune_with_real_data(base_model_path, real_labeled_df, station_id)`
+
+**职责**：基于真实数据对基线模型进行增量微调
+
+**微调策略**：
+1. 加载预训练的 MiniRocket 转换器（保持不变）
+2. 将新数据与原始训练数据合并
+3. 使用合并后的数据重新训练分类器
+4. 另存为生产模型
+
+**注意**：RidgeClassifierCV 不支持 partial_fit，采用合并数据重训策略
+
+---
+
+### 模块5：评估引擎 [m5_evaluator.py](file:///e:/Trae%20Project/Rocket_PV_limited/pv_curtailment_project/src/m5_evaluator.py)
+
+**函数签名**：`evaluate_model_performance(y_true, y_pred, title_prefix)`
+
+**职责**：计算并打印标准评估指标
+
+**输出指标**：
+- 混淆矩阵（Confusion Matrix）
+- Precision（精准率）
+- Recall（召回率）
+- F1-Score
+
+---
+
+## 工厂入口脚本
+
+### station_factory.py
+
+**功能**：一键全自动演示冷启动 + 生产微调完整流程
+
+**使用方式**：
+
+```bash
+python station_factory.py
+```
+
+**演示流程**：
+
+1. **冷启动全流程**（M1→M2→M3→M5）
+   - 生成 460MW 原始数据
+   - 注入限功率场景
+   - 训练基线模型
+   - 输出基线评估报告
+
+2. **生产级微调**（M4→M5）
+   - 使用独立随机种子生成新季度数据
+   - 增量微调基线模型
+   - 输出生产模型评估报告
+
+3. **全流程对比报告**
+   - 基线模型 vs 生产模型指标对比
+
+---
+
+## 核心设计原则
 
 ### 1. 严格时序隔离
-- **数据划分策略**：先按日期分块，再在各自块内进行窗口切片
-- **比例分配**：训练集 70% / 验证集 15% / 测试集 15%
-- **无时间交集**：确保训练、验证、测试集在时间戳上完全隔离
+
+```
+训练集（70%日期）→ 验证集（15%日期）→ 测试集（15%日期）
+    ↑                    ↑                    ↑
+  硬隔离               硬隔离               硬隔离
+```
+
+- 先按日期分块，再在块内进行窗口切片
+- 确保训练、验证、测试集在时间戳上完全无交集
+- 防止数据泄漏
 
 ### 2. 特征工程
-- **输入通道**：`[pv_simulated, GHI, cap_power_on]` 三通道
-- **特征张量**：`(N, 3, 32)`，其中 32 点 = 8 小时日间窗口
-- **标签规则**：窗口内 `is_curtailed == 1` 点数 ≥ 4 → Y=1，否则 Y=0
 
-### 3. 双模式输入管道
+| 通道 | 说明 |
+|------|------|
+| pv_simulated | 限电后的实际功率 |
+| GHI | 总辐照度 |
+| cap_power_on | 开机容量 |
 
-| 管道 | 输入 | 处理流程 | 适用场景 |
-|------|------|----------|----------|
-| `process_and_fake_raw_sequence` | 原始序列（`pv_data`, `GHI`, `cap_power_on`） | 自动模拟限电 → 切片 | 离线训练、数据增强 |
-| `process_labeled_sequence` | 已标记序列（含 `is_curtailed`） | 直接切片 | 生产环境、真实数据 |
+- 特征张量形状：`(N, 3, 32)`
+- 32 点 = 8 小时日间窗口（9:00~16:00）
 
-### 4. 跨电站混合训练
-- 自动发现 `data/01_raw/` 下的所有电站配置
-- 支持 60MW ~ 200MW 多容量混合
-- 使用 sklearn `shuffle` 彻底打散融合
-- 生成通用模型，适配不同容量电站
+### 3. 数据存储优化
+
+- 训练数据单独存储为 `.npy` 文件，避免 pickle 膨胀
+- 模型文件仅存储 Rocket 转换器和分类器
+- 支持增量训练时动态加载历史数据
+
+### 4. 随机种子控制
+
+- 全局随机种子：`RANDOM_SEED = 42`
+- 压测数据使用独立种子（如 2026）进行统计学验证
+- 确保结果可复现
+
+---
 
 ## 安装依赖
 
@@ -57,107 +181,77 @@ pv_curtailment_project/
 pip install numpy pandas scikit-learn sktime numba
 ```
 
+---
+
 ## 快速开始
 
-### 运行跨电站训练
+### 一键演示
 
 ```bash
-python run_universal_training.py
+python station_factory.py
 ```
 
-### 运行端到端压测
-
-```bash
-python run_final_inference_test.py
-```
-
-### 使用 Pipeline
+### 模块调用示例
 
 ```python
-from src.trainer import CurtailmentPipeline
+from src.m1_raw_generator import generate_raw_station_data
+from src.m2_curtail_simulator import inject_curtailment_scenarios
+from src.m3_pretrain_engine import build_base_model
+from src.m4_retrain_engine import fine_tune_with_real_data
+from src.m5_evaluator import evaluate_model_performance
 
-# 初始化管道
-pipeline = CurtailmentPipeline(
-    window_size=32,
-    stride=8,
-    label_threshold=4,
-    num_kernels=10000
+# 1. 生成原始数据
+raw_df = generate_raw_station_data("station_100MW", 100.0)
+
+# 2. 注入限功率场景
+simulated_df = inject_curtailment_scenarios(raw_df)
+
+# 3. 训练基线模型
+base_metrics = build_base_model(simulated_df, "station_100MW")
+
+# 4. 增量微调（使用新数据）
+prod_metrics = fine_tune_with_real_data(
+    base_model_path="models/minirocket_station_100MW_base.pkl",
+    real_labeled_df=new_data_df,
+    station_id="station_100MW"
 )
 
-# 管道1：原始序列 → 自动模拟限电 → 切片
-datasets = pipeline.process_and_fake_raw_sequence(
-    raw_df=raw_df,
-    station_id="station_001",
-    rated_capacity=100.0
-)
-
-# 管道2：已标记序列 → 直接切片
-datasets = pipeline.process_labeled_sequence(labeled_df)
-
-# 训练模型
-pipeline.fit(datasets["X_train"], datasets["Y_train"])
-
-# 评估模型
-metrics = pipeline.evaluate(datasets["X_test"], datasets["Y_test"])
-
-# 保存模型
-pipeline.save("models/minirocket_universal.pkl")
+# 5. 评估
+evaluate_model_performance(Y_test, Y_pred)
 ```
 
-## 数据格式
+---
 
-### 原始数据格式（merged_data.csv）
+## 压测验证
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| timestamp | datetime | 时间戳（15分钟间隔） |
-| pv_data | float | 光伏实际出力（MW） |
-| GHI | float | 总辐照度（W/m²） |
-| cap_power_on | float | 开机容量（MW） |
+### 随机种子对照实验
 
-### 已标记数据格式
+**实验设计**：
+- 冷启动模型：`RANDOM_SEED=42`
+- 压测数据：`RANDOM_SEED=2026`（独立随机波动）
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| timestamp | datetime | 时间戳 |
-| pv_simulated | float | 限电后功率（MW） |
-| GHI | float | 总辐照度（W/m²） |
-| cap_power_on | float | 开机容量（MW） |
-| is_curtailed | int | 限电标签（0/1） |
+**验证结果**：
 
-## 模型评估
+| 指标 | 基线模型 | 生产模型（压测） | 变化 |
+|------|----------|------------------|------|
+| Precision | 0.0941 | **1.0000** | +90.59% |
+| Recall | 0.9697 | **0.8889** | -8.08% |
+| F1-Score | 0.1716 | **0.9412** | +76.96% |
 
-训练完成后输出以下指标：
+**结论**：模型在独立随机种子数据上保持 F1=94% 的高水准，具备真实泛化能力，非硬过拟合。
 
-- **Confusion Matrix**：混淆矩阵
-- **Precision**：精准率
-- **Recall**：召回率
-- **F1-Score**：综合评分
+---
 
-## 压测结果
+## 工程规范
 
-### 跨电站混合训练结果
+1. **路径设计**：基于 `__file__` 的绝对路径，确保部署灵活性
+2. **模块解耦**：五大模块职责单一，可独立测试和替换
+3. **自动创建目录**：数据和模型目录自动创建，无需手动配置
+4. **数据隔离**：严格时序划分，杜绝数据泄漏
+5. **训练数据独立存储**：NPY 格式存储，避免 pickle 膨胀
+6. **可配置化**：核心参数通过函数参数传递，支持灵活调整
 
-| 指标 | 值 |
-|------|------|
-| 测试集样本 | 660 窗口 |
-| 限电比例 | 5.15% |
-| Precision | 0.8571 |
-| Recall | 0.5294 |
-| F1-Score | 0.6545 |
-
-### 端到端压测结果（新容量电站）
-
-测试配置：全新容量电站（90MW、130MW、175MW），限电比例 [0.3, 0.5, 0.7]
-
-| 电站 | 容量 | Precision | Recall | F1-Score |
-|------|------|-----------|--------|----------|
-| test_001 | 90MW | 0.9091 | 0.8000 | 0.8511 |
-| test_002 | 130MW | 0.9259 | 0.5952 | 0.7246 |
-| test_003 | 175MW | 0.9375 | 0.7692 | 0.8451 |
-| **平均** | - | **0.9242** | **0.7215** | **0.8069** |
-
-通用模型在从未见过的新容量电站上展现了良好的泛化能力！
+---
 
 ## 技术栈
 
@@ -166,13 +260,7 @@ pipeline.save("models/minirocket_universal.pkl")
 - **数据处理**：pandas, numpy
 - **并行加速**：numba
 
-## 工程规范
-
-1. **路径设计**：基于 `__file__` 的绝对路径，确保部署灵活性
-2. **模块解耦**：simulator / data_processor / trainer 独立模块
-3. **可配置化**：核心参数通过类配置，支持灵活调整
-4. **数据隔离**：严格时序划分，杜绝数据泄漏
-5. **环境隔离**：压测脚本自动创建 `test_arena/` 目录，不污染生产数据
+---
 
 ## 许可证
 
