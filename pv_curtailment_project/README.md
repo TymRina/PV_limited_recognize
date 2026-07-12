@@ -21,7 +21,9 @@ pv_curtailment_project/
 │   ├── data_processor.py    # 数据预处理与切片工具
 │   ├── trainer.py           # CurtailmentPipeline 训练类
 │   └── legacy/              # 历史版本代码（存档）
-└── run_universal_training.py # 跨电站训练主入口
+├── test_arena/              # 端到端压测目录（运行时自动创建）
+├── run_universal_training.py      # 跨电站训练主入口
+└── run_final_inference_test.py    # 端到端压测脚本
 ```
 
 ## 核心设计
@@ -61,6 +63,12 @@ pip install numpy pandas scikit-learn sktime numba
 
 ```bash
 python run_universal_training.py
+```
+
+### 运行端到端压测
+
+```bash
+python run_final_inference_test.py
 ```
 
 ### 使用 Pipeline
@@ -126,6 +134,31 @@ pipeline.save("models/minirocket_universal.pkl")
 - **Recall**：召回率
 - **F1-Score**：综合评分
 
+## 压测结果
+
+### 跨电站混合训练结果
+
+| 指标 | 值 |
+|------|------|
+| 测试集样本 | 660 窗口 |
+| 限电比例 | 5.15% |
+| Precision | 0.8571 |
+| Recall | 0.5294 |
+| F1-Score | 0.6545 |
+
+### 端到端压测结果（新容量电站）
+
+测试配置：全新容量电站（90MW、130MW、175MW），限电比例 [0.3, 0.5, 0.7]
+
+| 电站 | 容量 | Precision | Recall | F1-Score |
+|------|------|-----------|--------|----------|
+| test_001 | 90MW | 0.9091 | 0.8000 | 0.8511 |
+| test_002 | 130MW | 0.9259 | 0.5952 | 0.7246 |
+| test_003 | 175MW | 0.9375 | 0.7692 | 0.8451 |
+| **平均** | - | **0.9242** | **0.7215** | **0.8069** |
+
+通用模型在从未见过的新容量电站上展现了良好的泛化能力！
+
 ## 技术栈
 
 - **时序分类**：MiniRocket（sktime）
@@ -139,6 +172,7 @@ pipeline.save("models/minirocket_universal.pkl")
 2. **模块解耦**：simulator / data_processor / trainer 独立模块
 3. **可配置化**：核心参数通过类配置，支持灵活调整
 4. **数据隔离**：严格时序划分，杜绝数据泄漏
+5. **环境隔离**：压测脚本自动创建 `test_arena/` 目录，不污染生产数据
 
 ## 许可证
 
